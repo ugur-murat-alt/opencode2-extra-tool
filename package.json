@@ -18,7 +18,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ugur-murat-alt/opencode2-extra-tool.git"
+    "url": "git+https://github.com/ugur-murat-alt/opencode2-extra-tool.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
