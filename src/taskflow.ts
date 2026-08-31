@@ -1,7 +1,7 @@
 import type { Context as PluginContext } from "@opencode-ai/plugin/promise/plugin";
 import { startTaskFlowBackend, type TaskFlowBackend } from "./taskflow-backend";
 
-const TASKFLOW_STATUSES = ["pending", "in_progress", "completed", "cancelled"] as const;
+const TASKFLOW_STATUSES = ["pending", "in_progress", "completed", "blocked", "cancelled"] as const;
 type TaskFlowStatus = (typeof TASKFLOW_STATUSES)[number];
 const TASKFLOW_STATE_VERSION = 1 as const;
 const TASKFLOW_STORAGE_PREFIX = "taskflow/session/";
@@ -15,6 +15,7 @@ const TASKFLOW_LIMITS = {
   stepContent: 5_000,
   agent: 256,
   finalReport: 20_000,
+  continuation: 12_000,
 } as const;
 const TASKFLOW_HISTORY_LIMIT = 200;
 
@@ -57,6 +58,7 @@ export type TaskFlowPlan = {
 export type TaskFlowStepTelemetry = {
   startedAt?: number;
   completedAt?: number;
+  blockedAt?: number;
   cancelledAt?: number;
 };
 
@@ -86,6 +88,7 @@ export type TaskFlowSnapshot = TaskFlowRevision & {
     pending: number;
     inProgress: number;
     completed: number;
+    blocked: number;
     cancelled: number;
     completionRatio: number;
   };
@@ -123,10 +126,12 @@ function parseTelemetry(value: unknown): Record<string, TaskFlowStepTelemetry> {
     const item = raw as Record<string, unknown>;
     const startedAt = finiteTime(item.startedAt);
     const completedAt = finiteTime(item.completedAt);
+    const blockedAt = finiteTime(item.blockedAt);
     const cancelledAt = finiteTime(item.cancelledAt);
     result[id] = {
       ...(startedAt === undefined ? {} : { startedAt }),
       ...(completedAt === undefined ? {} : { completedAt }),
+      ...(blockedAt === undefined ? {} : { blockedAt }),
       ...(cancelledAt === undefined ? {} : { cancelledAt }),
     };
   }
@@ -275,6 +280,13 @@ function telemetryFor(
       };
       continue;
     }
+    if (step.status === "blocked") {
+      result[step.id] = {
+        ...(old.startedAt === undefined ? {} : { startedAt: old.startedAt }),
+        blockedAt: oldStatus === "blocked" && old.blockedAt !== undefined ? old.blockedAt : now,
+      };
+      continue;
+    }
     result[step.id] = {
       ...(old.startedAt === undefined ? {} : { startedAt: old.startedAt }),
       cancelledAt: oldStatus === "cancelled" && old.cancelledAt !== undefined ? old.cancelledAt : now,
@@ -362,7 +374,7 @@ export function createTaskFlowStore(
     update: (sessionID, plan) => mutate(sessionID, async () => {
       const previous = await get(sessionID);
       const timestamp = now();
-      const complete = remainingSteps(plan).length === 0;
+      const complete = unfinishedSteps(plan).length === 0;
       const revision: TaskFlowRevision = {
         version: TASKFLOW_STATE_VERSION,
         sessionID,
@@ -412,7 +424,7 @@ export function createTaskFlowStore(
       if (
         !previous ||
         previous.revision !== revision ||
-        remainingSteps(previous.plan).length > 0 ||
+        unfinishedSteps(previous.plan).length > 0 ||
         finiteTime(report.createdAt) === undefined ||
         text.length === 0 ||
         text.length > TASKFLOW_LIMITS.finalReport
@@ -515,10 +527,43 @@ function remainingSteps(plan: TaskFlowPlan): TaskFlowStep[] {
   return plan.steps.filter((step) => step.status === "pending" || step.status === "in_progress");
 }
 
-function formatRemaining(plan: TaskFlowPlan): string {
-  return remainingSteps(plan)
-    .map((step) => `${step.id}: ${step.content}${step.agent ? ` [agent: ${step.agent}]` : ""}`)
-    .join("; ");
+function unfinishedSteps(plan: TaskFlowPlan): TaskFlowStep[] {
+  return plan.steps.filter(
+    (step) => step.status === "pending" || step.status === "in_progress" || step.status === "blocked",
+  );
+}
+
+function formatProgress(plan: TaskFlowPlan): string {
+  const groups: Array<[TaskFlowStatus, string]> = [
+    ["completed", "Tamamlananlar"],
+    ["in_progress", "Sürdürülenler"],
+    ["pending", "Yapılacaklar"],
+    ["blocked", "Engellenenler"],
+    ["cancelled", "İptal edilenler"],
+  ];
+  return groups
+    .flatMap(([status, label]) => {
+      const steps = plan.steps
+        .filter((step) => step.status === status)
+        .map((step) => `${step.id}: ${step.content}${step.agent ? ` [agent: ${step.agent}]` : ""}`);
+      return steps.length === 0 ? [] : [`${label}: ${steps.join("; ")}`];
+    })
+    .join(" | ");
+}
+
+function continuationMessage(plan: TaskFlowPlan): string {
+  const before =
+    "BU SİSTEM MESAJIDIR! Taskflow'da tamamlanmamış işler var. Kullanıcıya yanıt vermeden önce devam edebildiğin kalan adımları tamamla. Tamamladığın işleri completed, sürdürdüğün işi in_progress, henüz başlamadıklarını pending olarak işaretle ve ilerlemeyi taskflow aracını kullanarak anlamlı aşamalarda güncelle. İş doğrulanmış bir engel nedeniyle devam ettirilemiyorsa ilgili adımı blocked olarak işaretle; yalnızca blocked işler kaldığında otomatik uyandırma durur. Şu ana kadar yaptıkların ve yapacağın işler: ";
+  const after =
+    ". Gerçek çalışmayı ve kontrolleri tamamladıktan sonra kullanıcıya sonucu, engelleri ve riskleri özetle; Taskflow'un iç takip ayrıntılarını yanıta dahil etme.";
+  const truncated = " [iş listesi mesaj sınırında kısaltıldı]";
+  const available = TASKFLOW_LIMITS.continuation - before.length - after.length;
+  const progress = formatProgress(plan);
+  const bounded =
+    progress.length <= available
+      ? progress
+      : `${progress.slice(0, Math.max(0, available - truncated.length))}${truncated}`;
+  return `${before}${bounded}${after}`;
 }
 
 export function taskFlowSnapshot(
@@ -530,6 +575,7 @@ export function taskFlowSnapshot(
     pending: 0,
     inProgress: 0,
     completed: 0,
+    blocked: 0,
     cancelled: 0,
     completionRatio: 0,
   };
@@ -537,6 +583,7 @@ export function taskFlowSnapshot(
     if (step.status === "pending") summary.pending += 1;
     else if (step.status === "in_progress") summary.inProgress += 1;
     else if (step.status === "completed") summary.completed += 1;
+    else if (step.status === "blocked") summary.blocked += 1;
     else summary.cancelled += 1;
   }
   summary.completionRatio = summary.total === 0 ? 0 : summary.completed / summary.total;
@@ -568,7 +615,7 @@ export function taskFlowToolFactory(store: TaskFlowStore): TaskFlowTool {
   return {
     name: "taskflow",
     description:
-      "Persist and track the complete plan for the current session until every required step is finished. Update it when creating the plan, changing its definition, or reaching a meaningful milestone; do not repeat an unchanged plan after every action.",
+      "Persist and track the complete plan for the current session until every required step is finished. Update step statuses at meaningful milestones. Use blocked only when a verified blocker prevents further work; blocked work pauses automatic continuation without completing the plan. Do not repeat an unchanged plan after every action.",
     input: {
       type: "object",
       properties: {
@@ -608,7 +655,12 @@ export function taskFlowToolFactory(store: TaskFlowStore): TaskFlowTool {
                 minLength: 1,
                 maxLength: TASKFLOW_LIMITS.stepContent,
               },
-              status: { type: "string", enum: TASKFLOW_STATUSES },
+              status: {
+                type: "string",
+                enum: TASKFLOW_STATUSES,
+                description:
+                  "pending: not started; in_progress: actively worked; completed: finished and verified; blocked: cannot continue because of a verified blocker; cancelled: intentionally removed from scope",
+              },
               agent: {
                 type: "string",
                 minLength: 1,
@@ -635,14 +687,17 @@ export function taskFlowToolFactory(store: TaskFlowStore): TaskFlowTool {
       const plan = parseTaskFlowPlan(rawInput);
       const state = await store.update(toolContext.sessionID, plan);
       const remaining = remainingSteps(plan);
+      const unfinished = unfinishedSteps(plan);
       return {
         // Keep internal revision/change metadata in the authenticated backend
         // and audit record, not in the model-facing tool result.
         output: { plan, snapshot: { summary: taskFlowSnapshot(state).summary } },
         content:
-          remaining.length === 0
-            ? "Taskflow state updated. All planned work is complete. Respond with a concise user-facing final report focused on the delivered work, checks, and remaining blockers or risks. Keep internal bookkeeping out of the response."
-            : `Taskflow state updated. Remaining steps: ${remaining.length}. Continue the remaining work before replying.`,
+          unfinished.length === 0
+            ? "Taskflow durumu güncellendi. Planlanan bütün işler tamamlandı. Kullanıcıya yapılan işleri, kontrolleri ve kalan riskleri anlatan kısa bir sonuç raporu ver; iç takip ayrıntılarını yanıta dahil etme."
+            : remaining.length === 0
+              ? "Taskflow durumu güncellendi. Yalnızca blocked adımlar kaldığı için otomatik uyandırma durduruldu; plan tamamlanmış sayılmadı. Kullanıcıya doğrulanmış engelleri ve çalışmanın devam etmesi için gerekenleri bildir."
+              : `Taskflow durumu güncellendi. Devam edilebilir kalan adım sayısı: ${remaining.length}. Kullanıcıya yanıt vermeden önce çalışmayı sürdür; anlamlı aşamalarda durumları taskflow aracıyla güncelle. Doğrulanmış bir engel varsa ilgili adımı blocked olarak işaretle.`,
       };
     },
   };
@@ -667,20 +722,14 @@ export async function addTaskFlowContext(store: TaskFlowStore, event: ContextEve
   removeTaskFlowAuditMessages(event.messages);
   const state = await store.get(event.sessionID);
   if (!state) return;
-  const remaining = remainingSteps(state.plan);
-  if (remaining.length === 0) {
+  if (unfinishedSteps(state.plan).length === 0) {
     if (!state.finalReport) {
       event.system.push({
         type: "text",
-        text: "Taskflow is complete. Respond with a concise user-facing final report focused on the actual work: delivered changes or outcome, completed/cancelled steps, acceptance-criteria status, verification checks, and remaining blockers or risks. Keep internal bookkeeping out of the response unless the user explicitly asks.",
+        text: "Taskflow tamamlandı. Kullanıcıya gerçek çalışmayı anlatan kısa bir sonuç raporu ver: yapılan değişiklikler veya sonuç, tamamlanan ya da iptal edilen adımlar, kabul koşullarının durumu, doğrulama kontrolleri ve kalan engeller veya riskler. Kullanıcı açıkça istemedikçe Taskflow'un iç takip ayrıntılarını yanıta dahil etme.",
       });
     }
-    return;
   }
-  event.system.push({
-    type: "text",
-    text: `Taskflow is active. Finish the remaining work before stopping: ${formatRemaining(state.plan)}. Keep Taskflow bookkeeping internal; update the taskflow tool only when creating the plan, changing its definition, or reaching a meaningful milestone, not after every action. Keep internal bookkeeping out of user-facing responses.`,
-  });
 }
 
 type SendContinuation = (sessionID: string, text: string, revision: number) => Promise<void>;
@@ -696,7 +745,7 @@ export async function resumeIncompleteTaskFlow(
   }
   await send(
     sessionID,
-    `Taskflow has unfinished work. Continue these remaining steps before replying: ${formatRemaining(state.plan)}. Then provide a user-facing summary of the actual work and checks; keep internal bookkeeping out of the response.`,
+    continuationMessage(state.plan),
     state.revision,
   );
   await store.markResumed(sessionID, state.revision);
@@ -751,7 +800,7 @@ async function captureTaskFlowFinalReport(
   const state = await store.get(sessionID);
   if (
     !state ||
-    remainingSteps(state.plan).length > 0 ||
+    unfinishedSteps(state.plan).length > 0 ||
     state.finalReport?.revision === state.revision
   )
     return;

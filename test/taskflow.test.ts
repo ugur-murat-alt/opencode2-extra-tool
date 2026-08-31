@@ -51,6 +51,7 @@ describe("taskflow", () => {
       pending: 1,
       inProgress: 0,
       completed: 1,
+      blocked: 0,
       cancelled: 0,
       completionRatio: 0.5,
     });
@@ -62,26 +63,105 @@ describe("taskflow", () => {
     expect(await store.get("session-b")).toBeUndefined();
   });
 
-  test("hydrates durable state and keeps one continuation per revision across restarts", async () => {
+  test("hydrates durable state and keeps one detailed continuation per revision across restarts", async () => {
     const memory = memoryPersistence();
     const first = createTaskFlowStore(memory.persistence, () => 100);
     await first.update("session-a", activePlan);
-    const sent: Array<{ sessionID: string; revision: number }> = [];
-    const send = async (sessionID: string, _text: string, revision: number) => {
-      sent.push({ sessionID, revision });
+    const sent: Array<{ sessionID: string; revision: number; text: string }> = [];
+    const send = async (sessionID: string, text: string, revision: number) => {
+      sent.push({ sessionID, revision, text });
     };
 
     const second = createTaskFlowStore(memory.persistence, () => 200);
     expect(await resumeIncompleteTaskFlow(second, "session-a", send)).toBe(true);
     const third = createTaskFlowStore(memory.persistence, () => 300);
     expect(await resumeIncompleteTaskFlow(third, "session-a", send)).toBe(false);
-    expect(sent).toEqual([{ sessionID: "session-a", revision: 1 }]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ sessionID: "session-a", revision: 1 });
+    expect(sent[0]?.text).toContain("BU SİSTEM MESAJIDIR!");
+    expect(sent[0]?.text).toContain("Tamamlananlar: plan: Define the plan");
+    expect(sent[0]?.text).toContain("Yapılacaklar: review: Review the result [agent: reviewer]");
+    expect(sent[0]?.text).toContain("taskflow aracını kullanarak");
+    expect(sent[0]?.text).toContain("blocked olarak işaretle");
     expect((await third.get("session-a"))?.continuationCount).toBe(1);
     expect((await third.get("session-a"))?.history.every((item) => !("history" in item))).toBe(true);
 
     await third.update("session-a", activePlan);
     expect(await resumeIncompleteTaskFlow(third, "session-a", send)).toBe(true);
-    expect(sent.at(-1)).toEqual({ sessionID: "session-a", revision: 2 });
+    expect(sent.at(-1)).toMatchObject({ sessionID: "session-a", revision: 2 });
+  });
+
+  test("pauses continuation for blocked work without completing the plan", async () => {
+    const memory = memoryPersistence();
+    const store = createTaskFlowStore(memory.persistence, () => 100);
+    const blockedPlan: TaskFlowPlan = {
+      ...activePlan,
+      steps: activePlan.steps.map((step) =>
+        step.id === "review" ? { ...step, status: "blocked" as const } : step,
+      ),
+    };
+    const blocked = await store.update("session-a", blockedPlan);
+    const restarted = createTaskFlowStore(memory.persistence, () => 200);
+    const hydrated = await restarted.get("session-a");
+    const sent: string[] = [];
+
+    expect(hydrated).toBeDefined();
+    expect(taskFlowSnapshot(hydrated!).summary).toMatchObject({ blocked: 1, pending: 0 });
+    expect(hydrated?.completedAt).toBeUndefined();
+    expect(hydrated?.stepTelemetry.review).toEqual({ blockedAt: 100 });
+    const blockedSystem: Array<{ type: "text"; text: string }> = [];
+    await addTaskFlowContext(restarted, { sessionID: "session-a", system: blockedSystem });
+    expect(blockedSystem).toEqual([]);
+    expect(
+      await resumeIncompleteTaskFlow(restarted, "session-a", async (_sessionID, text) => {
+        sent.push(text);
+      }),
+    ).toBe(false);
+    expect(sent).toEqual([]);
+    expect(
+      (await restarted.recordFinalReport("session-a", blocked.revision, {
+        createdAt: 200,
+        text: "Incorrect final report",
+      }))?.finalReport,
+    ).toBeUndefined();
+
+    const tool = taskFlowToolFactory(restarted);
+    const blockedResult = await tool.execute(blockedPlan, { sessionID: "session-b" });
+    expect(blockedResult.content).toContain("otomatik uyandırma durduruldu");
+    expect(JSON.stringify(tool.input)).toContain("blocked");
+
+    const resumed = await restarted.update("session-a", activePlan);
+    expect(
+      await resumeIncompleteTaskFlow(restarted, "session-a", async (_sessionID, text) => {
+        sent.push(text);
+      }),
+    ).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect((await restarted.get("session-a"))?.resumedRevision).toBe(resumed.revision);
+  });
+
+  test("bounds continuation text for the largest valid plan", async () => {
+    const store = createTaskFlowStore();
+    const plan = parseTaskFlowPlan({
+      title: "Large plan",
+      objective: "Finish without flooding model context",
+      acceptanceCriteria: ["Continuation stays bounded"],
+      steps: Array.from({ length: 200 }, (_, index) => ({
+        id: `step-${index}`,
+        content: "x".repeat(5_000),
+        status: index === 0 ? "in_progress" : "completed",
+      })),
+    });
+    await store.update("session-a", plan);
+    let continuation = "";
+
+    expect(
+      await resumeIncompleteTaskFlow(store, "session-a", async (_sessionID, text) => {
+        continuation = text;
+      }),
+    ).toBe(true);
+    expect(continuation.length).toBeLessThanOrEqual(12_000);
+    expect(continuation).toContain("iş listesi mesaj sınırında kısaltıldı");
   });
 
   test("keeps revision history in durable state without creating audit messages", async () => {
@@ -232,7 +312,7 @@ describe("taskflow", () => {
     ).toThrow("must not contain more than 200 items");
   });
 
-  test("adds plan guidance without registering or injecting an agent", async () => {
+  test("does not repeat active plan guidance on model context calls", async () => {
     const store = createTaskFlowStore();
     await store.update("session-a", activePlan);
     const system: Array<{ type: "text"; text: string }> = [];
@@ -244,11 +324,9 @@ describe("taskflow", () => {
     ];
 
     await addTaskFlowContext(store, { sessionID: "session-a", system, messages });
+    await addTaskFlowContext(store, { sessionID: "session-a", system, messages });
 
-    expect(system).toHaveLength(1);
-    expect(system[0]?.text).toContain("reviewer");
-    expect(system[0]?.text).toContain("remaining work");
-    expect(system[0]?.text).not.toMatch(/revision|snapshot/i);
+    expect(system).toEqual([]);
     expect(messages).toEqual([
       { metadata: { taskflow: "continue", revision: 1 } },
       { metadata: { source: "user" } },
@@ -305,8 +383,8 @@ describe("taskflow", () => {
 
     await addTaskFlowContext(store, { sessionID: "session-a", system });
 
-    expect(system[0]?.text).toContain("final report");
-    expect(system[0]?.text).toContain("actual work");
+    expect(system[0]?.text).toContain("sonuç raporu");
+    expect(system[0]?.text).toContain("gerçek çalışmayı");
     expect(system[0]?.text).not.toMatch(/revision|snapshot|telemetry/i);
   });
 });
@@ -378,7 +456,7 @@ describe("taskflow plugin integration", () => {
 
     const system: Array<{ type: "text"; text: string }> = [];
     await contextHooks[0]?.({ sessionID: "session-a", system });
-    expect(system[0]?.text).toContain("remaining work");
+    expect(system).toEqual([]);
 
     emitIdle();
     await continuation;
